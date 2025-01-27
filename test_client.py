@@ -2,6 +2,7 @@
 import socket
 import sys
 import time
+import select
 from dataclasses import dataclass
 import struct
 
@@ -21,37 +22,70 @@ class TestClient:
         self.host = host
         self.port = port
         self.socket = None
+        self.connected = False
+        self.running = True
 
     def connect(self):
         try:
+            if self.socket:
+                self.socket.close()
+            
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.connect((self.host, self.port))
+            self.connected = True
             print(f"Connected to server at {self.host}:{self.port}")
             return True
         except Exception as e:
             print(f"Connection failed: {e}")
+            self.connected = False
             return False
 
-    def send_led_control(self, led_pattern: int):
-        """
-        Send LED control packet
-        led_pattern: binary pattern for LED control (e.g., 0b01 for LED1, 0b10 for LED2, 0b11 for both)
-        """
+    def reconnect(self):
+        print("Attempting to reconnect...")
+        self.close()
+        time.sleep(1)
+        return self.connect()
+
+    def send_led_control(self, led_pattern: int) -> bool:
+        if not self.connected:
+            print("Not connected to server")
+            return False
+
         packet = ProtocolPacket(
             obj_id=1,  # 1 is LED object ID
             data1=led_pattern,
             data2=0
         )
+        
         try:
-            self.socket.send(packet.pack())
-            print(f"Sent LED control packet: pattern={bin(led_pattern)}")
-        except Exception as e:
+            data = packet.pack()
+            print(f"Sending LED control packet: pattern={bin(led_pattern)}")
+            print("Raw data:", ' '.join([f"{b:02x}" for b in data]))
+            self.socket.send(data)
+            
+            # Wait for acknowledgment
+            ready = select.select([self.socket], [], [], 2.0)
+            if ready[0]:
+                ack = self.socket.recv(15)
+                if ack:
+                    print("Received acknowledgment from server")
+                    return True
+            return False
+        except socket.error as e:
             print(f"Failed to send packet: {e}")
+            self.connected = False
+            return False
 
     def close(self):
+        self.running = False
         if self.socket:
-            self.socket.close()
-            print("Connection closed")
+            try:
+                self.socket.close()
+            except:
+                pass
+            self.socket = None
+        self.connected = False
+        print("Connection closed")
 
 def led_test_sequence(client: TestClient):
     """Run a test sequence for LED control"""
@@ -64,8 +98,15 @@ def led_test_sequence(client: TestClient):
 
     for pattern, description in test_patterns:
         print(f"\nTesting: {description}")
-        client.send_led_control(pattern)
-        time.sleep(2)  # Wait 2 seconds between patterns
+        if not client.send_led_control(pattern):
+            if not client.reconnect():
+                print("Failed to reconnect to server")
+                return False
+            if not client.send_led_control(pattern):
+                print("Failed to send pattern even after reconnection")
+                return False
+        time.sleep(1)
+    return True
 
 def main():
     if len(sys.argv) != 3:
@@ -80,20 +121,24 @@ def main():
     
     try:
         if client.connect():
-            print("\nStarting LED test sequence...")
-            while True:
+            while client.running:
                 print("\nTest Menu:")
                 print("1. Run automatic LED test sequence")
                 print("2. Control LED1")
                 print("3. Control LED2")
                 print("4. Control both LEDs")
                 print("5. Turn off all LEDs")
-                print("6. Exit")
+                print("6. Reconnect to server")
+                print("7. Exit")
                 
-                choice = input("\nEnter your choice (1-6): ")
+                try:
+                    choice = input("\nEnter your choice (1-7): ")
+                except EOFError:
+                    break
                 
                 if choice == '1':
-                    led_test_sequence(client)
+                    if not led_test_sequence(client):
+                        print("Test sequence failed")
                 elif choice == '2':
                     client.send_led_control(0b01)
                 elif choice == '3':
@@ -103,9 +148,13 @@ def main():
                 elif choice == '5':
                     client.send_led_control(0b00)
                 elif choice == '6':
+                    client.reconnect()
+                elif choice == '7':
                     break
                 else:
                     print("Invalid choice. Please try again.")
+                
+                time.sleep(0.1)
                     
     except KeyboardInterrupt:
         print("\nTest client shutting down...")

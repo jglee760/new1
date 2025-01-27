@@ -2,6 +2,9 @@
 import socket
 import threading
 import sys
+import time
+import select
+import signal
 from typing import Optional
 from led import LED
 
@@ -12,79 +15,158 @@ class RaspberryServer:
         self.client_socket: Optional[socket.socket] = None
         self.led = LED()
         self.running = True
+        self.client_address = None
         
+        # Set up signal handlers
+        signal.signal(signal.SIGINT, self.signal_handler)
+        signal.signal(signal.SIGTERM, self.signal_handler)
+        
+    def signal_handler(self, signum, frame):
+        """Handle termination signals"""
+        print("\nReceived termination signal. Shutting down...")
+        self.running = False
+        self.cleanup()
+        sys.exit(0)
+            
     def start(self):
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        
+        # Set socket timeout
+        self.server_socket.settimeout(1.0)
         
         try:
             self.server_socket.bind(('', self.port))
             self.server_socket.listen(5)
             print(f"====== Raspberry Pi - Android Communication =======")
             print(f"Server started on port {self.port}")
+            print("Press Ctrl+C to stop the server")
             
             while self.running:
-                print("Waiting for client connection...")
-                self.client_socket, addr = self.server_socket.accept()
-                print(f"Connected Client IP: {addr[0]}")
-                print(f"Client Port Num: {addr[1]}\n")
-                
-                client_thread = threading.Thread(target=self.handle_client)
-                client_thread.daemon = True
-                client_thread.start()
-                
+                try:
+                    # Accept with timeout
+                    self.client_socket, self.client_address = self.server_socket.accept()
+                    print(f"\nConnected Client IP: {self.client_address[0]}")
+                    print(f"Client Port Num: {self.client_address[1]}")
+                    
+                    self.handle_client_connection()
+                    
+                except socket.timeout:
+                    # Check if we should continue running
+                    continue
+                except socket.error as e:
+                    if self.running:
+                        print(f"Socket accept error: {e}")
+                    time.sleep(0.1)
+                    
         except Exception as e:
-            print(f"Server error: {e}")
+            if self.running:
+                print(f"Server error: {e}")
         finally:
             self.cleanup()
             
-    def handle_client(self):
+    def handle_client_connection(self):
+        """Handle a single client connection"""
+        if not self.client_socket:
+            return
+            
+        # Set client socket timeout
+        self.client_socket.settimeout(1.0)
+        buffer = bytearray()
+        packet_size = 15
+        
+        while self.running:
+            try:
+                ready = select.select([self.client_socket], [], [], 1.0)
+                if ready[0]:
+                    data = self.client_socket.recv(packet_size)
+                    if not data:
+                        print("Client disconnected")
+                        break
+                    
+                    buffer.extend(data)
+                    
+                    while len(buffer) >= packet_size:
+                        packet = buffer[:packet_size]
+                        buffer = buffer[packet_size:]
+                        self.process_packet(packet)
+                        
+            except socket.timeout:
+                continue
+            except socket.error as e:
+                if self.running:
+                    print(f"Socket error while receiving data: {e}")
+                break
+        
+        self.close_client()
+    
+    def process_packet(self, packet_data: bytes):
+        """Process a single packet"""
         try:
-            while self.running:
-                # Protocol packet is 15 bytes (2 STX + 4 obj_id + 4 data1 + 4 data2 + 1 ETX)
-                data = self.client_socket.recv(15)
-                if not data:
-                    break
-                    
-                # Print received data in hexadecimal for debugging
-                print("Received raw data:", ' '.join([f"{b:02x}" for b in data]))
+            if not self.running:
+                return
                 
-                if len(data) != 15:
-                    print(f"Invalid packet length: {len(data)}")
-                    continue
-                    
-                # Check STX and ETX
-                if data[0:2] != b'\xfd\xfe' or data[-1:] != b'\xff':
-                    print("Invalid packet markers")
-                    continue
+            print("Processing packet:", ' '.join([f"{b:02x}" for b in packet_data]))
+            
+            if packet_data[0:2] != b'\xfd\xfe' or packet_data[-1:] != b'\xff':
+                print("Invalid packet markers")
+                return
+            
+            obj_id = int.from_bytes(packet_data[2:6], byteorder='little')
+            data1 = int.from_bytes(packet_data[6:10], byteorder='little')
+            data2 = int.from_bytes(packet_data[10:14], byteorder='little')
+            
+            print(f"Parsed packet: obj_id={obj_id}, data1={data1}, data2={data2}")
+            
+            if obj_id == 1:
+                self.led.control_led(data1)
+                led_states = self.led.get_led_states()
+                print(f"LED states after change: {led_states}")
                 
-                # Parse packet fields
-                obj_id = int.from_bytes(data[2:6], byteorder='little')
-                data1 = int.from_bytes(data[6:10], byteorder='little')
-                data2 = int.from_bytes(data[10:14], byteorder='little')
-                
-                print(f"Parsed packet: obj_id={obj_id}, data1={data1}, data2={data2}")
-                
-                # Handle LED control (obj_id = 1 for LED)
-                if obj_id == 1:
-                    self.led.control_led(data1)
-                    led_states = self.led.get_led_states()
-                    print(f"LED states after change: {led_states}")
-                    
         except Exception as e:
-            print(f"Client handler error: {e}")
-        finally:
-            if self.client_socket:
+            if self.running:
+                print(f"Error processing packet: {e}")
+                
+    def close_client(self):
+        """Close the current client connection"""
+        if self.client_socket:
+            try:
                 self.client_socket.close()
-                self.client_socket = None
+            except:
+                pass
+            self.client_socket = None
+            self.client_address = None
+            if self.running:
+                print("Client connection closed")
                 
     def cleanup(self):
+        """Clean up server resources"""
+        print("\nCleaning up server...")
         self.running = False
+        
+        # Close client socket
         if self.client_socket:
-            self.client_socket.close()
+            try:
+                self.client_socket.close()
+            except:
+                pass
+            self.client_socket = None
+            
+        # Close server socket
         if self.server_socket:
-            self.server_socket.close()
-        self.led.gpio.cleanup()
+            try:
+                self.server_socket.close()
+            except:
+                pass
+            self.server_socket = None
+            
+        # Cleanup GPIO
+        try:
+            self.led.gpio.cleanup()
+        except:
+            pass
+            
+        print("Server cleanup completed")
 
 def main():
     if len(sys.argv) != 2:
@@ -101,6 +183,7 @@ def main():
         print("\nServer shutting down...")
     finally:
         server.cleanup()
+        sys.exit(0)
 
 if __name__ == "__main__":
     main()
